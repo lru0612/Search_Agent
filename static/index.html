@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agentic Search</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Agentic <span>Search</span></div>
+  <button id="newChatBtn" class="ghost-btn" title="New chat">New chat</button>
+</header>
+
+<main id="chat" class="chat">
+  <div id="empty" class="empty">
+    <h1>What would you like to search?</h1>
+    <p>I check whether your question is clear, rewrite the query, search and read pages over multiple steps, then answer with source citations.</p>
+  </div>
+</main>
+
+<footer class="composer-wrap">
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Ask anything…"></textarea>
+    <button id="sendBtn" class="send-btn" title="Send">
+      <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M3.4 20.4l17.4-7.5c.8-.4.8-1.5 0-1.8L3.4 3.6c-.7-.3-1.4.3-1.4 1l0 4.6c0 .5.4.9.9 1L15 12 2.9 13.8c-.5.1-.9.5-.9 1l0 4.6c0 .7.7 1.3 1.4 1z"/></svg>
+    </button>
+    <button id="stopBtn" class="stop-btn hidden" title="Stop">
+      <svg viewBox="0 0 24 24" width="16" height="16"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>
+    </button>
+  </div>
+  <div class="footnote">AI-generated answers — please verify the sources</div>
+</footer>
+
+<div id="hovercard" class="hovercard hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
