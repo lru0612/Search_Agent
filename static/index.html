@@ -4,14 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agentic Search</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='14' cy='14' r='9' fill='none' stroke='%23d97757' stroke-width='3.5'/%3E%3Cline x1='21' y1='21' x2='28' y2='28' stroke='%23d97757' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css?v=2">
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 </head>
 <body>
 <header class="topbar">
   <div class="brand">Agentic <span>Search</span></div>
-  <button id="newChatBtn" class="ghost-btn" title="New chat">New chat</button>
+  <div class="topbar-right">
+    <select id="modelSelect" class="model-select" title="Model"></select>
+    <button id="addModelBtn" class="ghost-btn" title="Add a temporary model">+ Model</button>
+    <button id="newChatBtn" class="ghost-btn" title="New chat">New chat</button>
+  </div>
 </header>
 
 <main id="chat" class="chat">
@@ -35,6 +40,20 @@
 </footer>
 
 <div id="hovercard" class="hovercard hidden"></div>
-<script src="/static/app.js"></script>
+
+<div id="modelModal" class="modal-overlay hidden">
+  <div class="modal">
+    <h2>Add a model</h2>
+    <p class="modal-note">Stored in this tab only — gone after a refresh.</p>
+    <label>Model name<input id="mName" type="text" placeholder="e.g. deepseek-chat"></label>
+    <label>Base URL<input id="mBase" type="text" placeholder="e.g. https://api.deepseek.com/v1"></label>
+    <label>API key<input id="mKey" type="password" placeholder="sk-…"></label>
+    <div class="modal-actions">
+      <button id="mCancel" class="ghost-btn">Cancel</button>
+      <button id="mSave" class="solid-btn">Save</button>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>

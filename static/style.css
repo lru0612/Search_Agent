@@ -51,6 +51,49 @@ body {
   transition: all .15s;
 }
 .ghost-btn:hover { border-color: var(--accent); color: var(--accent); }
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+.model-select {
+  appearance: none; -webkit-appearance: none; -moz-appearance: none;
+  background-color: var(--card);
+  /* 自定义下拉箭头：细线 chevron，替代系统默认符号 */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2387867f' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 6px 28px 6px 12px; font-size: 13px; font-family: var(--sans);
+  min-width: 140px; max-width: 220px; cursor: pointer; outline: none;
+  transition: border-color .15s;
+}
+.model-select:hover, .model-select:focus { border-color: var(--accent); }
+.solid-btn {
+  background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  border-radius: 8px; padding: 6px 16px; cursor: pointer; font-size: 13px;
+  transition: opacity .15s;
+}
+.solid-btn:hover { opacity: .85; }
+
+/* add-model modal */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0,0,0,.35);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 16px; padding: 24px 26px; width: 380px; max-width: 92vw;
+  box-shadow: 0 16px 48px rgba(0,0,0,.2);
+}
+.modal h2 { font-family: var(--serif); font-weight: 600; font-size: 19px; margin: 0 0 4px; }
+.modal-note { font-size: 12.5px; color: var(--text-dim); margin: 0 0 14px; }
+.modal label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 12px; }
+.modal input {
+  display: block; width: 100%; margin-top: 5px; box-sizing: border-box;
+  border: 1px solid var(--border); border-radius: 9px;
+  padding: 8px 12px; font-size: 14px; font-family: var(--sans);
+  background: var(--card); color: var(--text); outline: none;
+}
+.modal input:focus { border-color: var(--accent); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 
 .chat {
   flex: 1; overflow-y: auto;

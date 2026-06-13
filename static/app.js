@@ -9,6 +9,9 @@ const hovercard = document.getElementById("hovercard");
 
 let sessionId = null;
 let running = false;
+// temporary custom models, in memory only (lost on refresh)
+const customModels = [];
+let defaultModelName = "Default";
 let awaitingClarify = false; // next user input is a reply to ask_user
 let abortCtrl = null;
 
@@ -277,7 +280,7 @@ async function send() {
   awaitingClarify = false;
   newAssistantBlock();
   try {
-    await streamChat({ message: text, session_id: sessionId, resume: isResume });
+    await streamChat({ message: text, session_id: sessionId, resume: isResume, model_override: currentModelOverride() });
     // stream ended without any terminal event -> surface it instead of spinning forever
     if (cur && !cur.settled) {
       showError("The stream ended unexpectedly without a result. Check the server logs.");
@@ -299,6 +302,55 @@ stopBtn.onclick = async () => {
 };
 
 document.getElementById("newChatBtn").onclick = () => location.reload();
+
+// ------------------------------------------------ model selector
+
+const modelSelect = document.getElementById("modelSelect");
+const modelModal = document.getElementById("modelModal");
+
+function refreshModelSelect() {
+  const sel = modelSelect.value;
+  modelSelect.innerHTML = "";
+  const def = el("option", "", esc(`${defaultModelName} (default)`));
+  def.value = "";
+  modelSelect.appendChild(def);
+  customModels.forEach((m, i) => {
+    const o = el("option", "", esc(m.model));
+    o.value = String(i);
+    modelSelect.appendChild(o);
+  });
+  if ([...modelSelect.options].some(o => o.value === sel)) modelSelect.value = sel;
+}
+
+function currentModelOverride() {
+  const v = modelSelect.value;
+  if (v === "") return null;
+  const m = customModels[Number(v)];
+  return m ? { model: m.model, api_key: m.api_key, base_url: m.base_url } : null;
+}
+
+fetch("/api/config").then(r => r.json()).then(d => {
+  defaultModelName = d.default_model || "Default";
+  refreshModelSelect();
+}).catch(() => refreshModelSelect());
+
+document.getElementById("addModelBtn").onclick = () => {
+  modelModal.classList.remove("hidden");
+  document.getElementById("mName").focus();
+};
+document.getElementById("mCancel").onclick = () => modelModal.classList.add("hidden");
+modelModal.addEventListener("click", e => { if (e.target === modelModal) modelModal.classList.add("hidden"); });
+document.getElementById("mSave").onclick = () => {
+  const model = document.getElementById("mName").value.trim();
+  const base_url = document.getElementById("mBase").value.trim();
+  const api_key = document.getElementById("mKey").value.trim();
+  if (!model) { document.getElementById("mName").focus(); return; }
+  customModels.push({ model, base_url, api_key });
+  refreshModelSelect();
+  modelSelect.value = String(customModels.length - 1);
+  modelModal.classList.add("hidden");
+  for (const id of ["mName", "mBase", "mKey"]) document.getElementById(id).value = "";
+};
 
 function autoGrow() {
   inputEl.style.height = "auto";

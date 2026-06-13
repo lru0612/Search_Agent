@@ -28,6 +28,8 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
     resume: bool = False  # 是否为 ask_user 中断后的恢复请求
+    # 可选的临时模型覆盖（前端会话级，不持久化）：{model, api_key, base_url}
+    model_override: dict[str, str] | None = None
 
 
 def _sse(event: dict) -> dict:
@@ -75,6 +77,10 @@ async def _run_graph(req: ChatRequest) -> AsyncIterator[dict]:
     cancel.clear()
 
     config = {"configurable": {"thread_id": session_id}, "recursion_limit": 100}
+    if req.model_override:
+        config["configurable"]["model_override"] = {
+            k: v for k, v in req.model_override.items() if k in ("model", "api_key", "base_url") and v
+        }
     graph_input: Any
     if req.resume:
         graph_input = Command(resume=req.message)
@@ -141,6 +147,13 @@ async def _run_graph(req: ChatRequest) -> AsyncIterator[dict]:
 async def chat(req: ChatRequest):
     # 注意：sse-starlette 以 \r\n 作为行结尾，前端解析时已做归一化
     return EventSourceResponse(_run_graph(req))
+
+
+@app.get("/api/config")
+async def api_config():
+    from app.config import get_settings
+
+    return {"default_model": get_settings().model_name}
 
 
 @app.post("/api/cancel/{session_id}")

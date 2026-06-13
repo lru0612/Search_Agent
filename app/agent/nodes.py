@@ -6,6 +6,7 @@ from datetime import date
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langgraph.config import get_config
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
@@ -22,12 +23,19 @@ from app.tools.search import web_search
 def _llm(temperature: float = 0.2, streaming: bool = False) -> ChatOpenAI:
     """内部调用默认关闭流式：部分网关（如 OpenRouter）流式时在多个 chunk 重复携带
     usage，LangChain 聚合后 token 统计会虚高几十倍，导致预算误判。
-    只有 answer 节点需要流式（前端打字机效果）。"""
+    只有 answer 节点需要流式（前端打字机效果）。
+
+    运行时 config["configurable"]["model_override"] 可携带前端传来的临时模型配置。"""
     s = get_settings()
+    try:
+        config = get_config()
+    except RuntimeError:  # 不在图运行上下文中（如单测直接调用）
+        config = {}
+    o = (config.get("configurable") or {}).get("model_override") or {}
     return ChatOpenAI(
-        api_key=s.openai_api_key,
-        base_url=s.openai_base_url,
-        model=s.model_name,
+        api_key=o.get("api_key") or s.openai_api_key,
+        base_url=o.get("base_url") or s.openai_base_url,
+        model=o.get("model") or s.model_name,
         temperature=temperature,
         timeout=120,
         max_retries=2,
