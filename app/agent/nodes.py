@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import date
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -214,8 +215,47 @@ async def agent_node(state: AgentState) -> dict:
         )
     )
     messages = trim_messages(list(state["messages"]))
-    llm = _llm().bind_tools(TOOL_SCHEMAS, tool_choice="required")
-    resp: AIMessage = await llm.ainvoke([sys, *messages])
+    try:
+        llm = _llm().bind_tools(TOOL_SCHEMAS, tool_choice="required")
+        resp: AIMessage = await llm.ainvoke([sys, *messages])
+    except Exception as e:
+        # 部分 OpenRouter 路由/模型不支持 tool_choice="required"。
+        # 降级为普通 JSON 动作输出，再手动转成 LangChain tool_call。
+        if "tool_choice" not in str(e) and "No endpoints found" not in str(e):
+            raise
+        action_msg = HumanMessage(
+            content=(
+                "当前模型不支持原生工具调用。请只输出一个 JSON 对象，不要输出 Markdown。\n"
+                "schema: {\"action\":\"web_search|visit_page|ask_user|finish\", \"args\":{...}}\n"
+                "参数要求：\n"
+                "- web_search: {\"query\": string, \"max_results\": number}\n"
+                "- visit_page: {\"url\": string, \"reason\": string}\n"
+                "- ask_user: {\"question\": string, \"options\": string[]}\n"
+                "- finish: {\"answer_outline\": string}"
+            )
+        )
+        raw: AIMessage = await _llm().ainvoke([sys, *messages, action_msg])
+        obj = _extract_json_object(str(raw.content))
+        action = obj.get("action", "finish")
+        args = obj.get("args") or {}
+        name_by_action = {
+            "web_search": "WebSearch",
+            "visit_page": "VisitPage",
+            "ask_user": "AskUser",
+            "finish": "Finish",
+        }
+        resp = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": name_by_action.get(action, "Finish"),
+                    "args": args,
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "tool_call",
+                }
+            ],
+            usage_metadata=raw.usage_metadata,
+        )
 
     return {
         "messages": [resp],
