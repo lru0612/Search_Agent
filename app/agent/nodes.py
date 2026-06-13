@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -48,6 +49,52 @@ def _usage(msg: AIMessage) -> int:
     return meta.get("total_tokens", 0)
 
 
+def _extract_json_object(text: str) -> dict:
+    """从模型输出中提取第一个 JSON object，兼容 ```json fenced block。"""
+    text = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
+    if fenced:
+        text = fenced.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+    return json.loads(text)
+
+
+async def _structured_invoke(schema: type[BaseModel], messages: list) -> tuple[BaseModel, AIMessage]:
+    """优先使用原生 structured output；不兼容时降级为 JSON prompt 手动解析。
+
+    一些 OpenAI 兼容网关（Render 上常见的代理 / SiliconFlow / OpenRouter 组合）
+    对 LangChain 的 with_structured_output 支持不完全，可能返回 parsed=None 或抛
+    TypeError。这里做降级，避免首次 clarify 就中断。
+    """
+    try:
+        raw = await _llm().with_structured_output(schema, include_raw=True).ainvoke(messages)
+        parsed = raw.get("parsed")
+        raw_msg = raw.get("raw")
+        if parsed is not None and raw_msg is not None:
+            return parsed, raw_msg
+        if raw_msg is not None and getattr(raw_msg, "content", None):
+            return schema.model_validate(_extract_json_object(str(raw_msg.content))), raw_msg
+    except Exception:
+        # 继续走 JSON fallback；错误会在 fallback 也失败时暴露。
+        pass
+
+    fallback_messages = [
+        *messages,
+        HumanMessage(
+            content=(
+                "请严格只输出一个 JSON 对象，不要输出 Markdown 或解释文字。\n"
+                f"JSON schema: {json.dumps(schema.model_json_schema(), ensure_ascii=False)}"
+            )
+        ),
+    ]
+    raw_msg = await _llm().ainvoke(fallback_messages)
+    return schema.model_validate(_extract_json_object(str(raw_msg.content))), raw_msg
+
+
 def _fmt_clarifications(state: AgentState) -> str:
     items = state.get("clarifications") or []
     if not items:
@@ -71,8 +118,8 @@ async def clarify_node(state: AgentState) -> dict:
     updates: dict = {"phase": "CLARIFYING", "pending_question": {}}
 
     if rounds < settings.max_clarify_rounds:
-        llm = _llm().with_structured_output(ClarifyResult, include_raw=True)
-        raw = await llm.ainvoke(
+        result, raw_msg = await _structured_invoke(
+            ClarifyResult,
             [
                 SystemMessage(content=prompts.CLARIFY_SYSTEM),
                 HumanMessage(
@@ -80,10 +127,9 @@ async def clarify_node(state: AgentState) -> dict:
                         query=state["query"], clarifications=_fmt_clarifications(state)
                     )
                 ),
-            ]
+            ],
         )
-        result: ClarifyResult = raw["parsed"]
-        updates["total_tokens"] = state.get("total_tokens", 0) + _usage(raw["raw"])
+        updates["total_tokens"] = state.get("total_tokens", 0) + _usage(raw_msg)
 
         if result.is_ambiguous and result.clarifying_question:
             updates["pending_question"] = {
@@ -121,8 +167,8 @@ class RewriteResult(BaseModel):
 
 
 async def rewrite_node(state: AgentState) -> dict:
-    llm = _llm(temperature=0.3).with_structured_output(RewriteResult, include_raw=True)
-    raw = await llm.ainvoke(
+    result, raw_msg = await _structured_invoke(
+        RewriteResult,
         [
             SystemMessage(content=prompts.REWRITE_SYSTEM.format(today=date.today().isoformat())),
             HumanMessage(
@@ -130,9 +176,9 @@ async def rewrite_node(state: AgentState) -> dict:
                     query=state["query"], clarifications=_fmt_clarifications(state)
                 )
             ),
-        ]
+        ],
     )
-    queries = raw["parsed"].queries[:3] or [state["query"]]
+    queries = result.queries[:3] or [state["query"]]
     task = (
         f"用户问题：{state['query']}\n"
         f"澄清补充：{_fmt_clarifications(state)}\n"
@@ -142,7 +188,7 @@ async def rewrite_node(state: AgentState) -> dict:
     return {
         "rewritten_queries": queries,
         "messages": [HumanMessage(content=task)],
-        "total_tokens": state.get("total_tokens", 0) + _usage(raw["raw"]),
+        "total_tokens": state.get("total_tokens", 0) + _usage(raw_msg),
         "phase": "SEARCHING",
     }
 
@@ -324,8 +370,8 @@ async def reflect_node(state: AgentState) -> dict:
     history = "\n".join(
         f"- {str(m.content)[:150]}" for m in state["messages"][-8:] if isinstance(m, ToolMessage)
     )
-    llm = _llm().with_structured_output(ReflectResult, include_raw=True)
-    raw = await llm.ainvoke(
+    result, raw_msg = await _structured_invoke(
+        ReflectResult,
         [
             SystemMessage(content=prompts.REFLECT_SYSTEM),
             HumanMessage(
@@ -336,10 +382,9 @@ async def reflect_node(state: AgentState) -> dict:
                     history=history or "（无）",
                 )
             ),
-        ]
+        ],
     )
-    result: ReflectResult = raw["parsed"]
-    updates["total_tokens"] = state.get("total_tokens", 0) + _usage(raw["raw"])
+    updates["total_tokens"] = state.get("total_tokens", 0) + _usage(raw_msg)
     updates["reflect_rounds"] = rounds + 1
 
     if not result.sufficient and (result.missing_aspects or result.conflicts):
