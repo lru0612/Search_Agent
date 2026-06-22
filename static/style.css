@@ -164,12 +164,13 @@ body {
 
 /* 澄清卡片 */
 .clarify-card {
+  max-width: 720px;
   background: var(--card);
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
   border-radius: 12px;
   padding: 16px 18px;
-  margin-bottom: 22px;
+  margin: 0 auto 22px;
 }
 .clarify-card .q { font-weight: 600; margin-bottom: 10px; }
 .clarify-card .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }

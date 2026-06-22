@@ -1,4 +1,6 @@
 .env
 traces/
+runs/
+data/
 __pycache__/
 *.pyc

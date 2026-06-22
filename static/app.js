@@ -17,6 +17,7 @@ let abortCtrl = null;
 
 // rendering state for the current turn
 let cur = null; // {timelineEl, stepsEl, mdEl, answerText, citations, settled}
+const assistantBlocks = new WeakMap();
 
 function el(tag, cls, html) {
   const e = document.createElement(tag);
@@ -26,6 +27,16 @@ function el(tag, cls, html) {
 }
 function scrollBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function safeHttpUrl(url) {
+  const raw = String(url || "").trim();
+  if (!/^https?:\/\//i.test(raw) || /[\u0000-\u001F\u007F]/.test(raw)) return null;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
 
 function addUserMsg(text) {
   emptyEl?.classList.add("hidden");
@@ -49,11 +60,13 @@ function newAssistantBlock() {
     stepsEl: timeline.querySelector(".steps"),
     titleEl: timeline.querySelector(".tl-title"),
     mdEl: md,
+    msgEl: m,
     answerText: "",
     citations: [],
     settled: false, // got final answer / ask_user / error / cancelled
     t0: Date.now(),
   };
+  assistantBlocks.set(m, cur);
   scrollBottom();
 }
 
@@ -86,13 +99,11 @@ function showError(message) {
 
 function renderAnswer() {
   if (!cur) return;
-  let html = DOMPurify.sanitize(marked.parse(cur.answerText));
-  html = html.replace(/\[(\d{1,3})\]/g, (m, n) => {
-    const src = cur.citations.find(c => String(c.id) === n);
-    if (!src) return m;
-    return `<a class="cite" data-id="${n}" href="${esc(src.url)}" target="_blank" rel="noopener">${n}</a>`;
-  });
-  cur.mdEl.innerHTML = html;
+  const cleanHtml = DOMPurify.sanitize(marked.parse(cur.answerText));
+  const tpl = document.createElement("template");
+  tpl.innerHTML = cleanHtml;
+  linkCitations(tpl.content, cur);
+  cur.mdEl.replaceChildren(tpl.content);
   scrollBottom();
 }
 
@@ -101,25 +112,84 @@ function renderSources() {
   const box = el("div", "sources");
   box.appendChild(el("div", "label", `Sources · ${cur.citations.length}`));
   for (const c of cur.citations) {
-    const a = el("a", "source-card");
-    a.href = c.url; a.target = "_blank"; a.rel = "noopener";
-    a.innerHTML = `<div class="t">[${c.id}] ${esc(c.title || c.url)}</div><div class="u">${esc(c.url)}</div>`;
-    box.appendChild(a);
+    const url = safeHttpUrl(c.url);
+    const item = el(url ? "a" : "div", "source-card");
+    if (url) {
+      item.href = url;
+      item.target = "_blank";
+      item.rel = "noopener noreferrer";
+    }
+    const title = el("div", "t");
+    title.textContent = `[${c.id}] ${c.title || c.url}`;
+    const urlText = el("div", "u");
+    urlText.textContent = c.url || "";
+    item.appendChild(title);
+    item.appendChild(urlText);
+    box.appendChild(item);
   }
   cur.mdEl.appendChild(box);
+}
+
+function linkCitations(root, turn) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!/\[\d{1,3}\]/.test(node.nodeValue || "")) return NodeFilter.FILTER_REJECT;
+      if (node.parentElement?.closest("a, code, pre")) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const textNodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) textNodes.push(node);
+
+  for (const node of textNodes) {
+    const frag = document.createDocumentFragment();
+    const text = node.nodeValue || "";
+    let last = 0;
+    for (const match of text.matchAll(/\[(\d{1,3})\]/g)) {
+      if (match.index > last) frag.appendChild(document.createTextNode(text.slice(last, match.index)));
+      frag.appendChild(makeCitationNode(turn, match[1], match[0]));
+      last = match.index + match[0].length;
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.replaceWith(frag);
+  }
+}
+
+function makeCitationNode(turn, id, fallbackText) {
+  const src = turn.citations.find(c => String(c.id) === String(id));
+  const url = src ? safeHttpUrl(src.url) : null;
+  if (!src || !url) return document.createTextNode(fallbackText);
+
+  const a = document.createElement("a");
+  a.className = "cite";
+  a.dataset.id = String(id);
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  a.textContent = String(id);
+  return a;
 }
 
 // citation hover card
 document.addEventListener("mouseover", e => {
   const cite = e.target.closest?.(".cite");
-  if (!cite || !cur) { hovercard.classList.add("hidden"); return; }
-  const src = cur.citations.find(c => String(c.id) === cite.dataset.id);
-  if (!src) return;
-  hovercard.innerHTML = `<div class="t">${esc(src.title || src.url)}</div><div class="s">${esc(src.snippet || "")}</div>`;
+  if (!cite) { hovercard.classList.add("hidden"); return; }
+  const msg = cite.closest(".msg.assistant");
+  const turn = msg ? assistantBlocks.get(msg) : null;
+  const src = turn?.citations.find(c => String(c.id) === cite.dataset.id);
+  if (!src) { hovercard.classList.add("hidden"); return; }
+
+  const title = el("div", "t");
+  title.textContent = src.title || src.url;
+  const snippet = el("div", "s");
+  snippet.textContent = src.snippet || "";
+  hovercard.replaceChildren(title, snippet);
   hovercard.classList.remove("hidden");
   const r = cite.getBoundingClientRect();
-  hovercard.style.left = Math.min(r.left, innerWidth - 360) + "px";
-  hovercard.style.top = (r.top > 200 ? r.top - hovercard.offsetHeight - 8 : r.bottom + 8) + "px";
+  const left = Math.max(12, Math.min(r.left, innerWidth - hovercard.offsetWidth - 12));
+  const top = r.top > hovercard.offsetHeight + 16 ? r.top - hovercard.offsetHeight - 8 : r.bottom + 8;
+  hovercard.style.left = left + "px";
+  hovercard.style.top = Math.max(12, Math.min(top, innerHeight - hovercard.offsetHeight - 12)) + "px";
 });
 
 // ------------------------------------------------ clarification card

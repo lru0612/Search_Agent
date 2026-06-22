@@ -45,3 +45,108 @@ def trim_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
         else:
             trimmed.append(m)
     return trimmed
+
+
+def build_planner_context(state: dict) -> tuple[str, int]:
+    """Build a compact decision context for the planner sub-agent."""
+    settings = get_settings()
+    remaining = settings.max_steps - int(state.get("step_count") or 0)
+    lines = [
+        f"用户问题：{state.get('query', '')}",
+        f"用户补充：{_format_clarifications(state)}",
+        f"剩余步骤：{max(remaining, 0)}",
+        f"禁用动作：{_compact_list(state.get('disabled_actions') or [])}",
+        f"已搜索：{_compact_list(state.get('searched_queries') or [])}",
+        f"已访问：{_compact_list(state.get('visited_urls') or [])}",
+    ]
+    if state.get("reflect_feedback"):
+        lines.append(f"质检反馈：{state['reflect_feedback']}")
+    if state.get("active_error"):
+        lines.append(f"上一步可修复错误：{state['active_error']}")
+    if state.get("scratchpad_summary"):
+        lines.append(f"历史摘要：{state['scratchpad_summary']}")
+    lines.extend(
+        [
+            "",
+            "最近动作：",
+            _format_action_history(state.get("action_history") or [], limit=5),
+            "",
+            "证据摘要：",
+            _format_evidence(state.get("evidence") or {}, limit=10),
+        ]
+    )
+    text = "\n".join(lines)
+    return text, estimate_tokens(text)
+
+
+def build_reflect_context(state: dict) -> tuple[str, int]:
+    lines = [
+        f"用户原始问题：{state.get('query', '')}",
+        f"用户补充：{_format_clarifications(state)}",
+        f"回答提纲：{state.get('finish_outline') or '（无）'}",
+        "",
+        "证据表：",
+        _format_evidence(state.get("evidence") or {}, limit=20),
+        "",
+        "近期动作摘要：",
+        _format_action_history(state.get("action_history") or [], limit=6),
+    ]
+    text = "\n".join(lines)
+    return text, estimate_tokens(text)
+
+
+def build_answer_context(state: dict) -> tuple[str, int]:
+    lines = [
+        f"用户问题：{state.get('query', '')}",
+        f"用户补充：{_format_clarifications(state)}",
+        f"回答提纲：{state.get('finish_outline') or '（无）'}",
+        "",
+        "证据表：",
+        _format_evidence(state.get("evidence") or {}, limit=30),
+    ]
+    text = "\n".join(lines)
+    return text, estimate_tokens(text)
+
+
+def _format_clarifications(state: dict) -> str:
+    items = state.get("clarifications") or []
+    if not items:
+        return "（无）"
+    return "；".join(f"{c.get('question', '')} -> {c.get('answer', '')}" for c in items)
+
+
+def _format_action_history(history: list[dict], limit: int) -> str:
+    if not history:
+        return "（无）"
+    items = history[-limit:]
+    return "\n".join(
+        (
+            f"- step={r.get('step', '?')} action={r.get('action', '')} "
+            f"status={r.get('status', '')} result={str(r.get('observation_summary') or r.get('error') or '')[:240]}"
+        )
+        for r in items
+    )
+
+
+def _format_evidence(evidence: dict[int, dict] | dict, limit: int) -> str:
+    if not evidence:
+        return "（暂无证据）"
+    values = list(evidence.values()) if isinstance(evidence, dict) else list(evidence)
+    lines = []
+    for e in values[:limit]:
+        facts = "；".join(e.get("key_facts") or [])
+        snippet = str(e.get("snippet") or "")[:500].replace("\n", " ")
+        lines.append(
+            f"[{e.get('id')}] {e.get('title')} — {e.get('url')}\n"
+            f"类型：{e.get('source_type', 'source')}；摘要：{snippet}\n"
+            f"关键事实：{facts or '（未抽取）'}"
+        )
+    return "\n\n".join(lines)
+
+
+def _compact_list(items: list, limit: int = 8) -> str:
+    if not items:
+        return "（无）"
+    shown = [str(x) for x in items[-limit:]]
+    prefix = f"…共 {len(items)} 项；最近：" if len(items) > limit else ""
+    return prefix + " | ".join(shown)

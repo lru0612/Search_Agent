@@ -18,10 +18,17 @@ class Settings(BaseSettings):
     max_clarify_rounds: int = 2
     token_budget: int = 120_000
     context_token_limit: int = 45_000
+    llm_timeout_s: float = 120.0
+    llm_max_retries: int = 2
 
     tool_timeout_s: float = 20.0
     page_content_max_chars: int = 24_000  # 约 8k tokens
     traces_dir: str = "traces"
+
+    bench_max_case_seconds: float = 120.0
+    bench_judge_model: str = ""
+    bench_runs_dir: str = "runs"
+    bench_default_limit: int = 5
 
 
 @lru_cache

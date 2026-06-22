@@ -30,6 +30,9 @@ class ChatRequest(BaseModel):
     resume: bool = False  # 是否为 ask_user 中断后的恢复请求
     # 可选的临时模型覆盖（前端会话级，不持久化）：{model, api_key, base_url}
     model_override: dict[str, str] | None = None
+    # benchmark / 自动化测试可传入，用于按组别归档 traces/{trace_group}/{run_id}/...
+    trace_group: str | None = None
+    run_id: str | None = None
 
 
 def _sse(event: dict) -> dict:
@@ -45,14 +48,20 @@ def _node_event(tracer: Tracer, node: str, update: dict[str, Any]) -> list[dict]
         events.append(
             tracer.emit("rewrite", queries=update.get("rewritten_queries", []), label="重写搜索查询")
         )
-    elif node == "agent":
+    elif node in ("agent", "planner"):
         msgs = update.get("messages") or []
         for m in msgs:
             for tc in getattr(m, "tool_calls", None) or []:
                 events.append(
                     tracer.emit("action", tool=tc["name"], args=tc["args"], step=update.get("step_count"))
                 )
-    elif node == "tools":
+        action = update.get("parsed_action") or {}
+        if action:
+            events.append(tracer.emit("action", tool=action.get("action"), args=action.get("args"), step=update.get("step_count")))
+    elif node == "parse_action":
+        if update.get("active_error"):
+            events.append(tracer.emit("invalid_action", error=update.get("active_error")))
+    elif node in ("tools", "execute_action"):
         for m in update.get("messages") or []:
             events.append(tracer.emit("observation", preview=str(m.content)[:300]))
     elif node == "force_finish":
@@ -72,7 +81,11 @@ def _node_event(tracer: Tracer, node: str, update: dict[str, Any]) -> list[dict]
 
 async def _run_graph(req: ChatRequest) -> AsyncIterator[dict]:
     session_id = req.session_id or uuid.uuid4().hex
-    tracer = _tracers.setdefault(session_id, Tracer(session_id))
+    tracer_key = f"{req.trace_group or ''}:{req.run_id or ''}:{session_id}"
+    tracer = _tracers.setdefault(
+        tracer_key,
+        Tracer(session_id, trace_group=req.trace_group, run_id=req.run_id),
+    )
     cancel = _cancel_events.setdefault(session_id, asyncio.Event())
     cancel.clear()
 
@@ -95,6 +108,17 @@ async def _run_graph(req: ChatRequest) -> AsyncIterator[dict]:
             "reflect_rounds": 0,
             "budget_exhausted": False,
             "phase": "CLARIFYING",
+            "action_history": [],
+            "evidence": {},
+            "active_error": "",
+            "scratchpad_summary": "",
+            "invalid_action_count": 0,
+            "self_correction_success_count": 0,
+            "ask_user_count": 0,
+            "tool_error_count": 0,
+            "tool_error_recovery_count": 0,
+            "planner_context_tokens": 0,
+            "answer_context_tokens": 0,
         }
 
     yield _sse(tracer.emit("session", session_id=session_id))
