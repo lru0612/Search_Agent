@@ -55,6 +55,7 @@ def build_planner_context(state: dict) -> tuple[str, int]:
         f"用户问题：{state.get('query', '')}",
         f"用户补充：{_format_clarifications(state)}",
         f"剩余步骤：{max(remaining, 0)}",
+        f"累计 token：{int(state.get('total_tokens') or 0)} / {settings.token_budget}",
         f"禁用动作：{_compact_list(state.get('disabled_actions') or [])}",
         f"已搜索：{_compact_list(state.get('searched_queries') or [])}",
         f"已访问：{_compact_list(state.get('visited_urls') or [])}",
@@ -71,8 +72,17 @@ def build_planner_context(state: dict) -> tuple[str, int]:
             "最近动作：",
             _format_action_history(state.get("action_history") or [], limit=5),
             "",
-            "证据摘要：",
-            _format_evidence(state.get("evidence") or {}, limit=10),
+            "候选文档池（C#，未剪枝）：",
+            _format_candidates(state.get("candidate_docs") or {}, state.get("pruned_candidate_ids") or [], limit=12),
+            "",
+            "已保留证据（E#，可用于最终引用）：",
+            _format_curated_evidence(state.get("curated_evidence") or {}, limit=10),
+            "",
+            "核验记录：",
+            _format_verifications(state.get("verification_records") or [], limit=6),
+            "",
+            "剪枝记录：",
+            _format_prune_history(state.get("prune_history") or [], limit=4),
         ]
     )
     text = "\n".join(lines)
@@ -85,8 +95,17 @@ def build_reflect_context(state: dict) -> tuple[str, int]:
         f"用户补充：{_format_clarifications(state)}",
         f"回答提纲：{state.get('finish_outline') or '（无）'}",
         "",
-        "证据表：",
+        "已保留证据：",
+        _format_curated_evidence(state.get("curated_evidence") or {}, limit=20),
+        "",
+        "兼容证据表：",
         _format_evidence(state.get("evidence") or {}, limit=20),
+        "",
+        "核验记录：",
+        _format_verifications(state.get("verification_records") or [], limit=10),
+        "",
+        "未剪枝候选补充：",
+        _format_candidates(state.get("candidate_docs") or {}, state.get("pruned_candidate_ids") or [], limit=8),
         "",
         "近期动作摘要：",
         _format_action_history(state.get("action_history") or [], limit=6),
@@ -101,8 +120,17 @@ def build_answer_context(state: dict) -> tuple[str, int]:
         f"用户补充：{_format_clarifications(state)}",
         f"回答提纲：{state.get('finish_outline') or '（无）'}",
         "",
-        "证据表：",
+        "已保留证据：",
+        _format_curated_evidence(state.get("curated_evidence") or {}, limit=30),
+        "",
+        "兼容证据表：",
         _format_evidence(state.get("evidence") or {}, limit=30),
+        "",
+        "核验记录：",
+        _format_verifications(state.get("verification_records") or [], limit=10),
+        "",
+        "未剪枝候选补充：",
+        _format_candidates(state.get("candidate_docs") or {}, state.get("pruned_candidate_ids") or [], limit=10),
     ]
     text = "\n".join(lines)
     return text, estimate_tokens(text)
@@ -142,6 +170,67 @@ def _format_evidence(evidence: dict[int, dict] | dict, limit: int) -> str:
             f"关键事实：{facts or '（未抽取）'}"
         )
     return "\n\n".join(lines)
+
+
+def _format_candidates(candidates: dict[int, dict] | dict, pruned_ids: list[int], limit: int) -> str:
+    if not candidates:
+        return "（暂无候选）"
+    pruned = {int(x) for x in pruned_ids}
+    values = list(candidates.values()) if isinstance(candidates, dict) else list(candidates)
+    active = [c for c in values if int(c.get("id", 0)) not in pruned and c.get("status") != "pruned"]
+    if not active:
+        return "（无未剪枝候选）"
+    lines = []
+    for c in active[:limit]:
+        text = str(c.get("content") or c.get("snippet") or "")[:600].replace("\n", " ")
+        lines.append(
+            f"[C{c.get('id')}] {c.get('title')} — {c.get('url')}\n"
+            f"状态：{c.get('status', 'candidate')}；来源：{c.get('source_type', 'source')}；"
+            f"token≈{c.get('token_estimate', 0)}；found_by={c.get('found_by_query') or '（无）'}\n"
+            f"摘要：{text}"
+        )
+    return "\n\n".join(lines)
+
+
+def _format_curated_evidence(curated: dict[int, dict] | dict, limit: int) -> str:
+    if not curated:
+        return "（暂无已保留证据）"
+    values = list(curated.values()) if isinstance(curated, dict) else list(curated)
+    lines = []
+    for e in values[:limit]:
+        source_id = e.get("source_id")
+        cite = f"[{source_id}]" if source_id else "（未登记来源）"
+        lines.append(
+            f"[E{e.get('id')}] C{e.get('candidate_id')} -> {cite} {e.get('title')} — {e.get('url')}\n"
+            f"claim：{e.get('claim')}\n"
+            f"证据：{str(e.get('quote_or_summary') or '')[:500]}\n"
+            f"confidence：{e.get('confidence')}"
+        )
+    return "\n\n".join(lines)
+
+
+def _format_verifications(records: list[dict], limit: int) -> str:
+    if not records:
+        return "（暂无核验记录）"
+    items = records[-limit:]
+    return "\n".join(
+        (
+            f"- verdict={r.get('verdict')} sources={r.get('source_ids')} "
+            f"claim={str(r.get('claim') or '')[:160]} "
+            f"reason={str(r.get('reasoning') or r.get('missing_or_conflict') or '')[:220]}"
+        )
+        for r in items
+    )
+
+
+def _format_prune_history(history: list[dict], limit: int) -> str:
+    if not history:
+        return "（暂无剪枝）"
+    items = history[-limit:]
+    return "\n".join(
+        f"- step={r.get('step')} candidates={r.get('candidate_ids')} reason={str(r.get('reason') or '')[:180]}"
+        for r in items
+    )
 
 
 def _compact_list(items: list, limit: int = 8) -> str:

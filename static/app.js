@@ -237,7 +237,22 @@ function showClarify(data) {
 
 // ------------------------------------------------ SSE handling
 
-const ACTION_LABELS = { WebSearch: "Search", VisitPage: "Read", AskUser: "Ask", Finish: "Finish" };
+const ACTION_LABELS = {
+  WebSearch: "Search",
+  web_search: "Search",
+  VisitPage: "Read",
+  visit_page: "Read",
+  AskUser: "Ask",
+  ask_user: "Ask",
+  CurateEvidence: "Curate",
+  curate_evidence: "Curate",
+  PruneCandidates: "Prune",
+  prune_candidates: "Prune",
+  VerifyClaim: "Verify",
+  verify_claim: "Verify",
+  Finish: "Finish",
+  finish: "Finish",
+};
 
 function handleEvent(type, data) {
   switch (type) {
@@ -253,9 +268,12 @@ function handleEvent(type, data) {
     case "action": {
       const label = ACTION_LABELS[data.tool] || data.tool;
       let txt = "";
-      if (data.tool === "WebSearch") txt = data.args.query;
-      else if (data.tool === "VisitPage") txt = `${data.args.url}${data.args.reason ? ` (${data.args.reason})` : ""}`;
-      else if (data.tool === "Finish") txt = "Evidence is sufficient, preparing the answer";
+      if (data.tool === "WebSearch" || data.tool === "web_search") txt = data.args.query;
+      else if (data.tool === "VisitPage" || data.tool === "visit_page") txt = `${data.args.url}${data.args.reason ? ` (${data.args.reason})` : ""}`;
+      else if (data.tool === "CurateEvidence" || data.tool === "curate_evidence") txt = `C${data.args.candidate_id} · ${data.args.claim || ""}`;
+      else if (data.tool === "PruneCandidates" || data.tool === "prune_candidates") txt = `${(data.args.candidate_ids || []).map(id => `C${id}`).join(", ")} · ${data.args.reason || ""}`;
+      else if (data.tool === "VerifyClaim" || data.tool === "verify_claim") txt = `${data.args.claim || ""} · sources ${(data.args.source_ids || []).join(", ")}`;
+      else if (data.tool === "Finish" || data.tool === "finish") txt = "Evidence is sufficient, preparing the answer";
       else txt = JSON.stringify(data.args);
       addStep(label, `Step ${data.step ?? "?"} · ${txt}`, true);
       break;
@@ -263,6 +281,26 @@ function handleEvent(type, data) {
     case "observation":
       addStep("Result", data.preview);
       break;
+    case "candidate": {
+      const latest = (data.latest || []).map(c => `C${c.id}: ${c.title || c.url}`).join("  |  ");
+      addStep("Candidates", `${data.count || 0} active${latest ? ` · ${latest}` : ""}`);
+      break;
+    }
+    case "curate": {
+      const e = data.evidence || {};
+      addStep("Curated", `E${e.id || "?"} · C${e.candidate_id || "?"} -> [${e.source_id || "?"}] · ${e.claim || ""}`, true);
+      break;
+    }
+    case "prune": {
+      const r = data.record || {};
+      addStep("Pruned", `${(r.candidate_ids || []).map(id => `C${id}`).join(", ")} · ${r.reason || ""}`, true);
+      break;
+    }
+    case "verify": {
+      const r = data.record || {};
+      addStep("Verified", `${r.verdict || "unknown"} · ${r.claim || ""}`, true);
+      break;
+    }
     case "reflect":
       addStep("Reflect", data.passed ? "Self-check passed" : `Gaps found: ${data.feedback || ""}`, true);
       break;

@@ -27,6 +27,11 @@ class AgentState(TypedDict, total=False):
     # 证据与来源
     sources: Annotated[dict[int, Source], _replace]
     evidence: Annotated[dict[int, "EvidenceItem"], _replace]
+    candidate_docs: Annotated[dict[int, "CandidateDoc"], _replace]
+    curated_evidence: Annotated[dict[int, "CuratedEvidenceItem"], _replace]
+    verification_records: Annotated[list["VerificationRecord"], _replace]
+    pruned_candidate_ids: Annotated[list[int], _replace]
+    prune_history: Annotated[list["PruneRecord"], _replace]
     visited_urls: Annotated[list[str], _replace]
     searched_queries: Annotated[list[str], _replace]
     action_history: Annotated[list["ActionRecord"], _replace]
@@ -58,7 +63,15 @@ class AgentState(TypedDict, total=False):
 
 
 class PlannerAction(TypedDict, total=False):
-    action: Literal["web_search", "visit_page", "ask_user", "finish"]
+    action: Literal[
+        "web_search",
+        "visit_page",
+        "ask_user",
+        "curate_evidence",
+        "prune_candidates",
+        "verify_claim",
+        "finish",
+    ]
     args: dict[str, Any]
     reason: str
     id: str
@@ -82,3 +95,44 @@ class EvidenceItem(TypedDict, total=False):
     key_facts: list[str]
     source_type: str
     confidence: float
+
+
+class CandidateDoc(TypedDict, total=False):
+    id: int
+    url: str
+    title: str
+    snippet: str
+    content: str
+    key_facts: list[str]
+    source_type: str
+    status: str
+    found_by_step: int
+    found_by_query: str
+    token_estimate: int
+    confidence: float
+    source_id: int
+
+
+class CuratedEvidenceItem(TypedDict, total=False):
+    id: int
+    candidate_id: int
+    source_id: int
+    url: str
+    title: str
+    claim: str
+    quote_or_summary: str
+    confidence: float
+
+
+class VerificationRecord(TypedDict, total=False):
+    claim: str
+    source_ids: list[int]
+    verdict: str
+    reasoning: str
+    missing_or_conflict: str
+
+
+class PruneRecord(TypedDict, total=False):
+    step: int
+    candidate_ids: list[int]
+    reason: str

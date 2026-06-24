@@ -61,9 +61,42 @@ def _node_event(tracer: Tracer, node: str, update: dict[str, Any]) -> list[dict]
     elif node == "parse_action":
         if update.get("active_error"):
             events.append(tracer.emit("invalid_action", error=update.get("active_error")))
+        action = update.get("parsed_action") or {}
+        if action and update.get("action_source") == "json":
+            events.append(
+                tracer.emit(
+                    "action",
+                    tool=action.get("action"),
+                    args=action.get("args"),
+                    step=(history[-1].get("step") if (history := update.get("action_history") or []) else None),
+                )
+            )
     elif node in ("tools", "execute_action"):
         for m in update.get("messages") or []:
             events.append(tracer.emit("observation", preview=str(m.content)[:300]))
+        history = update.get("action_history") or []
+        last_action = history[-1] if history else {}
+        action = last_action.get("action")
+        if action in {"web_search", "visit_page"}:
+            candidates = list((update.get("candidate_docs") or {}).values())
+            active = [c for c in candidates if c.get("status") != "pruned"]
+            events.append(
+                tracer.emit(
+                    "candidate",
+                    count=len(active),
+                    latest=active[-5:],
+                    label=f"候选文档池更新：{len(active)} 条可用候选",
+                )
+            )
+        elif action == "curate_evidence":
+            curated = list((update.get("curated_evidence") or {}).values())
+            events.append(tracer.emit("curate", evidence=curated[-1] if curated else {}, label="已保留关键证据"))
+        elif action == "prune_candidates":
+            prunes = update.get("prune_history") or []
+            events.append(tracer.emit("prune", record=prunes[-1] if prunes else {}, label="已剪枝低价值候选"))
+        elif action == "verify_claim":
+            records = update.get("verification_records") or []
+            events.append(tracer.emit("verify", record=records[-1] if records else {}, label="已核验关键论断"))
     elif node == "force_finish":
         events.append(tracer.emit("budget_exhausted", label="搜索预算已用尽，强制进入回答"))
     elif node == "reflect":
@@ -110,6 +143,11 @@ async def _run_graph(req: ChatRequest) -> AsyncIterator[dict]:
             "phase": "CLARIFYING",
             "action_history": [],
             "evidence": {},
+            "candidate_docs": {},
+            "curated_evidence": {},
+            "verification_records": [],
+            "pruned_candidate_ids": [],
+            "prune_history": [],
             "active_error": "",
             "scratchpad_summary": "",
             "invalid_action_count": 0,

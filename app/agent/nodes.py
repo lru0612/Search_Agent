@@ -23,7 +23,17 @@ from app.agent.state import AgentState
 from app.citations import extract_citations, format_sources_for_prompt, register_source
 from app.config import get_settings
 from app.tools.reader import visit_page
-from app.tools.schemas import AskUser, Finish, TOOL_NAME_MAP, TOOL_SCHEMAS, VisitPage, WebSearch
+from app.tools.schemas import (
+    AskUser,
+    CurateEvidence,
+    Finish,
+    PruneCandidates,
+    TOOL_NAME_MAP,
+    TOOL_SCHEMAS,
+    VerifyClaim,
+    VisitPage,
+    WebSearch,
+)
 from app.tools.search import web_search
 
 
@@ -217,6 +227,8 @@ async def planner_node(state: AgentState) -> dict:
     remaining = settings.max_steps - step
     if remaining <= 1:
         extra += "\n注意：这是最后一步预算，若无关键缺口请直接 Finish。"
+    if state.get("total_tokens", 0) >= int(settings.token_budget * 0.8):
+        extra += "\n注意：token 预算接近耗尽，请优先剪枝、保留证据、核验证据或 Finish，避免继续扩大搜索。"
 
     sys = SystemMessage(
         content=prompts.AGENT_SYSTEM.format(
@@ -236,11 +248,14 @@ async def planner_node(state: AgentState) -> dict:
         action_msg = HumanMessage(
             content=(
                 "当前模型不支持原生工具调用。请只输出一个 JSON 对象，不要输出 Markdown。\n"
-                "schema: {\"action\":\"web_search|visit_page|ask_user|finish\", \"args\":{...}, \"reason\": string}\n"
+                "schema: {\"action\":\"web_search|visit_page|ask_user|curate_evidence|prune_candidates|verify_claim|finish\", \"args\":{...}, \"reason\": string}\n"
                 "参数要求：\n"
                 "- web_search: {\"query\": string, \"max_results\": number}\n"
                 "- visit_page: {\"url\": string, \"reason\": string}\n"
                 "- ask_user: {\"question\": string, \"options\": string[]}\n"
+                "- curate_evidence: {\"candidate_id\": number, \"claim\": string, \"quote_or_summary\": string, \"confidence\": number}\n"
+                "- prune_candidates: {\"candidate_ids\": number[], \"reason\": string}\n"
+                "- verify_claim: {\"claim\": string, \"source_ids\": number[]}\n"
                 "- finish: {\"answer_outline\": string}"
             )
         )
@@ -281,19 +296,33 @@ def _append_action_record(state: AgentState, record: dict) -> list[dict]:
     return history[-30:]
 
 
-def _validate_action(action: str, args: dict, disabled_actions: list[str] | None = None) -> None:
+def _validate_action(
+    action: str,
+    args: dict,
+    disabled_actions: list[str] | None = None,
+    state: AgentState | None = None,
+) -> None:
     if action in set(disabled_actions or []):
         raise ValueError(f"action disabled in this run: {action}")
     schema_by_action = {
         "web_search": WebSearch,
         "visit_page": VisitPage,
         "ask_user": AskUser,
+        "curate_evidence": CurateEvidence,
+        "prune_candidates": PruneCandidates,
+        "verify_claim": VerifyClaim,
         "finish": Finish,
     }
     schema = schema_by_action.get(action)
     if not schema:
         raise ValueError(f"unknown action: {action}")
     schema.model_validate(args)
+    if state and action in {"web_search", "visit_page"}:
+        settings = get_settings()
+        if int(state.get("total_tokens") or 0) >= int(settings.token_budget * 0.95):
+            raise ValueError(
+                "token budget is nearly exhausted; curate/prune/verify existing evidence or finish"
+            )
 
 
 def _action_from_tool_call(tc: dict) -> dict:
@@ -320,11 +349,13 @@ async def parse_action_node(state: AgentState) -> dict:
     last: AIMessage = state["messages"][-1]
     try:
         tool_calls = getattr(last, "tool_calls", None) or []
+        action_source = "tool_call" if tool_calls else "json"
         action = _action_from_tool_call(tool_calls[0]) if tool_calls else _action_from_json(str(last.content))
-        _validate_action(action["action"], action["args"], state.get("disabled_actions") or [])
+        _validate_action(action["action"], action["args"], state.get("disabled_actions") or [], state)
         correction = 1 if state.get("active_error") else 0
         updates: dict = {
             "parsed_action": action,
+            "action_source": action_source,
             "active_error": "",
             "self_correction_success_count": state.get("self_correction_success_count", 0) + correction,
             "action_history": _append_action_record(
@@ -397,6 +428,182 @@ def _evidence_from_source(
     }
 
 
+class VerifyResult(BaseModel):
+    verdict: str = Field(description="supported / contradicted / insufficient / mixed")
+    reasoning: str = Field(description="核验理由")
+    missing_or_conflict: str = Field(default="", description="缺失证据或冲突点")
+
+
+def _next_id(items: dict[int, dict]) -> int:
+    return max((int(k) for k in items.keys()), default=0) + 1
+
+
+def _int_keyed(items: dict | None) -> dict[int, dict]:
+    return {int(k): v for k, v in (items or {}).items()}
+
+
+def _candidate_text(candidate: dict) -> str:
+    return str(candidate.get("content") or candidate.get("snippet") or "")
+
+
+def _candidate_snippet(candidate: dict, limit: int = 800) -> str:
+    text = _candidate_text(candidate)
+    return text[:limit].replace("\n", " ")
+
+
+def _register_candidate(
+    candidate_docs: dict[int, dict],
+    *,
+    url: str,
+    title: str,
+    snippet: str,
+    source_type: str,
+    state: AgentState,
+    found_by_query: str = "",
+    content: str = "",
+    confidence: float = 0.0,
+) -> tuple[dict[int, dict], int, bool]:
+    """Register or update a recoverable search candidate, deduped by URL."""
+    for cid, existing in candidate_docs.items():
+        if existing.get("url") != url:
+            continue
+        updated = dict(existing)
+        if title and (not updated.get("title") or len(title) > len(str(updated.get("title")))):
+            updated["title"] = title
+        if snippet and len(snippet) > len(str(updated.get("snippet") or "")):
+            updated["snippet"] = snippet[:1200]
+        if content and len(content) > len(str(updated.get("content") or "")):
+            updated["content"] = content
+        if source_type == "page" and updated.get("status") != "pruned":
+            updated["status"] = "read"
+        updated["token_estimate"] = estimate_tokens(_candidate_text(updated))
+        if confidence:
+            updated["confidence"] = max(float(updated.get("confidence") or 0.0), confidence)
+        return {**candidate_docs, int(cid): updated}, int(cid), False
+
+    cid = _next_id(candidate_docs)
+    text = content or snippet
+    candidate = {
+        "id": cid,
+        "url": url,
+        "title": title or url,
+        "snippet": snippet[:1200],
+        "content": content,
+        "key_facts": [text[:240].replace("\n", " ")] if text else [],
+        "source_type": source_type,
+        "status": "read" if source_type == "page" else "candidate",
+        "found_by_step": state.get("step_count", 0),
+        "found_by_query": found_by_query,
+        "token_estimate": estimate_tokens(text),
+        "confidence": confidence,
+    }
+    return {**candidate_docs, cid: candidate}, cid, True
+
+
+def _candidate_to_evidence(sid: int, candidate: dict, claim: str, quote_or_summary: str, confidence: float) -> dict:
+    snippet = quote_or_summary or _candidate_snippet(candidate)
+    facts = []
+    if claim:
+        facts.append(claim)
+    if quote_or_summary and quote_or_summary != claim:
+        facts.append(quote_or_summary[:240].replace("\n", " "))
+    return {
+        "id": sid,
+        "url": candidate.get("url", ""),
+        "title": candidate.get("title", candidate.get("url", "")),
+        "snippet": snippet[:800],
+        "key_facts": facts or [snippet[:240].replace("\n", " ")],
+        "source_type": candidate.get("source_type", "candidate"),
+        "confidence": confidence,
+    }
+
+
+def _resolve_verify_sources(source_ids: list[int], candidate_docs: dict[int, dict], sources: dict[int, dict]) -> str:
+    lines: list[str] = []
+    seen_candidates: set[int] = set()
+    for raw_id in source_ids:
+        sid = int(raw_id)
+        candidate = candidate_docs.get(sid)
+        if not candidate:
+            for c in candidate_docs.values():
+                if int(c.get("source_id") or -1) == sid:
+                    candidate = c
+                    break
+        if candidate and int(candidate.get("id", sid)) not in seen_candidates:
+            seen_candidates.add(int(candidate.get("id", sid)))
+            lines.append(
+                f"[C{candidate.get('id')}] {candidate.get('title')} — {candidate.get('url')}\n"
+                f"{_candidate_text(candidate)[:4000]}"
+            )
+            continue
+        source = sources.get(sid)
+        if source:
+            lines.append(f"[{sid}] {source.get('title')} — {source.get('url')}\n{source.get('snippet', '')}")
+    return "\n\n".join(lines)
+
+
+async def _verify_claim_with_llm(
+    claim: str,
+    source_ids: list[int],
+    candidate_docs: dict[int, dict],
+    sources: dict[int, dict],
+) -> tuple[dict, AIMessage]:
+    context = _resolve_verify_sources(source_ids, candidate_docs, sources)
+    if not context:
+        raise ValueError(f"no matching candidate/source ids for verification: {source_ids}")
+    result, raw_msg = await _structured_invoke(
+        VerifyResult,
+        [
+            SystemMessage(
+                content=(
+                    "你是证据核验模块。只根据给定来源判断 claim 是否被支持。"
+                    "verdict 只能使用 supported、contradicted、insufficient 或 mixed。"
+                )
+            ),
+            HumanMessage(content=f"Claim: {claim}\n\nSources:\n{context}"),
+        ],
+    )
+    return {
+        "claim": claim,
+        "source_ids": source_ids,
+        "verdict": result.verdict,
+        "reasoning": result.reasoning,
+        "missing_or_conflict": result.missing_or_conflict,
+    }, raw_msg
+
+
+def _ensure_fallback_answer_sources(state: AgentState) -> tuple[dict[int, dict], dict[int, dict], dict[int, dict]]:
+    """If no evidence was curated, expose active candidates as normal sources for legacy answer flow."""
+    sources = _int_keyed(state.get("sources") or {})
+    evidence = _int_keyed(state.get("evidence") or {})
+    candidate_docs = _int_keyed(state.get("candidate_docs") or {})
+    if sources or evidence:
+        return sources, evidence, candidate_docs
+
+    pruned = set(state.get("pruned_candidate_ids") or [])
+    active_candidates = [
+        c for c in candidate_docs.values() if int(c.get("id", 0)) not in pruned and c.get("status") != "pruned"
+    ][:10]
+    for candidate in active_candidates:
+        snippet = _candidate_snippet(candidate)
+        sources, sid = register_source(
+            sources,
+            str(candidate.get("url") or ""),
+            str(candidate.get("title") or candidate.get("url") or ""),
+            snippet,
+        )
+        candidate_docs[int(candidate["id"])] = {**candidate, "source_id": sid}
+        evidence[sid] = _evidence_from_source(
+            sid,
+            str(candidate.get("url") or ""),
+            str(candidate.get("title") or candidate.get("url") or ""),
+            snippet,
+            str(candidate.get("source_type") or "candidate"),
+            float(candidate.get("confidence") or 0.0),
+        )
+    return sources, evidence, candidate_docs
+
+
 async def execute_action_node(state: AgentState) -> dict:
     """执行 planner 选择的动作，登记来源、维护结构化记忆。"""
     action = state.get("parsed_action") or {}
@@ -404,8 +611,13 @@ async def execute_action_node(state: AgentState) -> dict:
     args = action.get("args") or {}
     reason = action.get("reason", "")
     tool_call_id = _tool_message_id(state)
-    sources = dict(state.get("sources") or {})
-    evidence = dict(state.get("evidence") or {})
+    sources = _int_keyed(state.get("sources") or {})
+    evidence = _int_keyed(state.get("evidence") or {})
+    candidate_docs = _int_keyed(state.get("candidate_docs") or {})
+    curated_evidence = _int_keyed(state.get("curated_evidence") or {})
+    verification_records = list(state.get("verification_records") or [])
+    pruned_candidate_ids = list(state.get("pruned_candidate_ids") or [])
+    prune_history = list(state.get("prune_history") or [])
     visited = list(state.get("visited_urls") or [])
     searched = list(state.get("searched_queries") or [])
     stagnant = state.get("stagnant_steps", 0)
@@ -428,19 +640,25 @@ async def execute_action_node(state: AgentState) -> dict:
                     stagnant += 1
                 else:
                     lines = []
+                    new_count = 0
                     for r in results:
-                        sources, sid = register_source(sources, r["url"], r["title"], r["snippet"])
-                        evidence[sid] = _evidence_from_source(
-                            sid,
-                            r["url"],
-                            r["title"],
-                            r["snippet"],
-                            "search",
-                            float(r.get("score") or 0.0),
+                        candidate_docs, cid, created = _register_candidate(
+                            candidate_docs,
+                            url=r["url"],
+                            title=r["title"],
+                            snippet=r["snippet"],
+                            source_type="search",
+                            state=state,
+                            found_by_query=q,
+                            confidence=float(r.get("score") or 0.0),
                         )
-                        lines.append(f"[{sid}] {r['title']}\nURL: {r['url']}\n摘要: {r['snippet']}")
-                    content = f"搜索「{q}」返回 {len(results)} 条结果：\n\n" + "\n\n".join(lines)
-                    stagnant = 0
+                        new_count += 1 if created else 0
+                        lines.append(f"[C{cid}] {r['title']}\nURL: {r['url']}\n摘要: {r['snippet']}")
+                    content = (
+                        f"搜索「{q}」返回 {len(results)} 条结果，新增候选 {new_count} 条：\n\n"
+                        + "\n\n".join(lines)
+                    )
+                    stagnant = 0 if new_count else stagnant + 1
 
         elif name == "visit_page":
             url = args["url"]
@@ -450,9 +668,18 @@ async def execute_action_node(state: AgentState) -> dict:
             else:
                 page = await visit_page(url)
                 visited.append(url)
-                sources, sid = register_source(sources, url, page["title"], page["content"][:500])
-                evidence[sid] = _evidence_from_source(sid, url, page["title"], page["content"], "page", 1.0)
-                content = f"[{sid}] 页面《{page['title']}》正文：\n\n{page['content']}"
+                candidate_docs, cid, created = _register_candidate(
+                    candidate_docs,
+                    url=url,
+                    title=page["title"],
+                    snippet=page["content"][:1200],
+                    content=page["content"],
+                    source_type="page",
+                    state=state,
+                    found_by_query=str(args.get("reason") or ""),
+                    confidence=1.0,
+                )
+                content = f"[C{cid}] 页面《{page['title']}》正文：\n\n{page['content']}"
                 stagnant = 0
 
         elif name == "ask_user":
@@ -468,6 +695,81 @@ async def execute_action_node(state: AgentState) -> dict:
                 {"question": args["question"], "answer": str(answer)}
             ]
             updates["ask_user_count"] = state.get("ask_user_count", 0) + 1
+            stagnant = 0
+        elif name == "curate_evidence":
+            cid = int(args["candidate_id"])
+            candidate = candidate_docs.get(cid)
+            if not candidate:
+                raise ValueError(f"candidate_id not found: {cid}")
+            if cid in set(pruned_candidate_ids) or candidate.get("status") == "pruned":
+                raise ValueError(f"candidate_id was pruned: {cid}")
+
+            claim = str(args["claim"])
+            quote_or_summary = str(args["quote_or_summary"])
+            confidence = float(args.get("confidence", 0.8))
+            sources, sid = register_source(
+                sources,
+                str(candidate.get("url") or ""),
+                str(candidate.get("title") or candidate.get("url") or ""),
+                quote_or_summary or _candidate_snippet(candidate),
+            )
+            candidate_docs[cid] = {**candidate, "status": "curated", "source_id": sid}
+
+            existing = evidence.get(sid)
+            item = _candidate_to_evidence(sid, candidate_docs[cid], claim, quote_or_summary, confidence)
+            if existing:
+                facts = list(existing.get("key_facts") or [])
+                for fact in item.get("key_facts") or []:
+                    if fact and fact not in facts:
+                        facts.append(fact)
+                item = {**existing, **item, "key_facts": facts}
+            evidence[sid] = item
+
+            eid = _next_id(curated_evidence)
+            curated_evidence[eid] = {
+                "id": eid,
+                "candidate_id": cid,
+                "source_id": sid,
+                "url": candidate_docs[cid].get("url", ""),
+                "title": candidate_docs[cid].get("title", ""),
+                "claim": claim,
+                "quote_or_summary": quote_or_summary,
+                "confidence": confidence,
+            }
+            content = f"已保留证据 E{eid}：候选 C{cid} -> 来源 [{sid}]；claim: {claim}"
+            stagnant = 0
+        elif name == "prune_candidates":
+            ids = [int(x) for x in args["candidate_ids"]]
+            missing = [cid for cid in ids if cid not in candidate_docs]
+            if missing:
+                raise ValueError(f"candidate_ids not found: {missing}")
+            reason_text = str(args["reason"])
+            pruned_set = set(pruned_candidate_ids)
+            for cid in ids:
+                candidate_docs[cid] = {**candidate_docs[cid], "status": "pruned"}
+                pruned_set.add(cid)
+            pruned_candidate_ids = sorted(pruned_set)
+            prune_history.append({"step": state.get("step_count", 0), "candidate_ids": ids, "reason": reason_text})
+            prune_history = prune_history[-30:]
+            content = f"已剪枝候选：{', '.join(f'C{cid}' for cid in ids)}。理由：{reason_text}"
+            stagnant = 0
+        elif name == "verify_claim":
+            source_ids = [int(x) for x in args["source_ids"]]
+            record, raw_msg = await _verify_claim_with_llm(
+                str(args["claim"]),
+                source_ids,
+                candidate_docs,
+                sources,
+            )
+            verification_records.append(record)
+            verification_records = verification_records[-30:]
+            updates["total_tokens"] = state.get("total_tokens", 0) + _usage(raw_msg)
+            content = (
+                f"核验结论：{record['verdict']}\n"
+                f"Claim: {record['claim']}\n"
+                f"理由：{record['reasoning']}\n"
+                f"缺口/冲突：{record.get('missing_or_conflict') or '无'}"
+            )
             stagnant = 0
         else:
             content = f"未知动作 {name}"
@@ -490,6 +792,11 @@ async def execute_action_node(state: AgentState) -> dict:
             "messages": [ToolMessage(content=content, tool_call_id=tool_call_id)],
             "sources": sources,
             "evidence": evidence,
+            "candidate_docs": candidate_docs,
+            "curated_evidence": curated_evidence,
+            "verification_records": verification_records,
+            "pruned_candidate_ids": pruned_candidate_ids,
+            "prune_history": prune_history,
             "visited_urls": visited,
             "searched_queries": searched,
             "stagnant_steps": stagnant,
@@ -580,8 +887,14 @@ def reflect_router(state: AgentState) -> str:
 # ---------------------------------------------------------------- answer
 
 async def answer_node(state: AgentState) -> dict:
-    sources = state.get("sources") or {}
-    answer_context, answer_context_tokens = build_answer_context(state)
+    sources, evidence, candidate_docs = _ensure_fallback_answer_sources(state)
+    answer_state = {
+        **state,
+        "sources": sources,
+        "evidence": evidence,
+        "candidate_docs": candidate_docs,
+    }
+    answer_context, answer_context_tokens = build_answer_context(answer_state)
 
     budget_note = (
         "搜索预算耗尽，信息可能不完整，请在回答开头声明这一点"
@@ -607,6 +920,9 @@ async def answer_node(state: AgentState) -> dict:
     return {
         "final_answer": answer,
         "cited_sources": extract_citations(answer, sources),
+        "sources": sources,
+        "evidence": evidence,
+        "candidate_docs": candidate_docs,
         "total_tokens": state.get("total_tokens", 0) + _usage(resp),
         "answer_context_tokens": state.get("answer_context_tokens", 0) + answer_context_tokens,
         "phase": "DONE",

@@ -10,6 +10,7 @@ import time
 from unittest.mock import patch
 
 from langchain_core.messages import AIMessage
+from app.agent.context import build_planner_context
 from app.agent import nodes
 
 
@@ -88,20 +89,30 @@ def apply_update(state: dict, update: dict) -> None:
 
 
 async def main() -> int:
-    # 脚本：clarify 判定歧义 → 用户补充 → 判定清晰 → rewrite → WebSearch → VisitPage → Finish → reflect 通过 → answer
+    _structured_idx.clear()
+    FakeChat._idx = 0
+    # 脚本：clarify 判定歧义 → 用户补充 → 判定清晰 → rewrite →
+    # WebSearch 候选池 → Prune → Curate → VisitPage → Curate → Verify → Finish → answer
     FakeChat.structured_scripts = {
         nodes.ClarifyResult: [
             nodes.ClarifyResult(is_ambiguous=True, reasons=["缺少时间"], clarifying_question="你指哪一年的发布会？", options=["2025", "2026"]),
             nodes.ClarifyResult(is_ambiguous=False),
         ],
         nodes.RewriteResult: [nodes.RewriteResult(queries=["苹果 2026 春季发布会 新品"])],
+        nodes.VerifyResult: [
+            nodes.VerifyResult(verdict="supported", reasoning="页面正文明确说明新 MacBook 搭载 M5 芯片。")
+        ],
         nodes.ReflectResult: [nodes.ReflectResult(sufficient=True, reasoning="证据充分")],
     }
     FakeChat.script = [
         make_tool_call("WebSearch", {"query": "苹果 2026 春季发布会 新品", "max_results": 5}),
-        make_tool_call("VisitPage", {"url": "https://example.com/a", "reason": "查看详情"}),
-        make_tool_call("Finish", {"answer_outline": "发布会内容 [1][2]"}),
-        AIMessage(content="苹果 2026 春季发布会发布了搭载 M5 芯片的新 MacBook [1]，发布会在 2026 年 3 月举行 [2]。", usage_metadata={"total_tokens": 30, "input_tokens": 15, "output_tokens": 15}),
+        make_tool_call("PruneCandidates", {"candidate_ids": [2], "reason": "候选 B 只有日期，和新品信息关系较弱"}),
+        make_tool_call("CurateEvidence", {"candidate_id": 1, "claim": "苹果 2026 春季发布会发布了新 MacBook", "quote_or_summary": "苹果 2026 春季发布会发布了新 MacBook。", "confidence": 0.9}),
+        make_tool_call("VisitPage", {"url": "https://example.com/a", "reason": "查看新品详情"}),
+        make_tool_call("CurateEvidence", {"candidate_id": 1, "claim": "新 MacBook 搭载 M5 芯片", "quote_or_summary": "详细内容：新 MacBook 搭载 M5 芯片，售价 1299 美元起。", "confidence": 1.0}),
+        make_tool_call("VerifyClaim", {"claim": "新 MacBook 搭载 M5 芯片", "source_ids": [1]}),
+        make_tool_call("Finish", {"answer_outline": "发布会新品与芯片信息 [1]"}),
+        AIMessage(content="苹果 2026 春季发布会发布了新 MacBook，并且该机型搭载 M5 芯片，售价 1299 美元起 [1]。", usage_metadata={"total_tokens": 30, "input_tokens": 15, "output_tokens": 15}),
     ]
 
     with patch.object(nodes, "_llm", lambda *a, **kw: FakeChat()), \
@@ -111,7 +122,9 @@ async def main() -> int:
             "query": "苹果发布会有什么新品", "clarifications": [], "clarify_rounds": 0,
             "step_count": 0, "total_tokens": 0, "stagnant_steps": 0,
             "reflect_rounds": 0, "budget_exhausted": False, "phase": "CLARIFYING",
-            "action_history": [], "evidence": {}, "active_error": "", "scratchpad_summary": "",
+            "action_history": [], "evidence": {}, "candidate_docs": {}, "curated_evidence": {},
+            "verification_records": [], "pruned_candidate_ids": [], "prune_history": [],
+            "active_error": "", "scratchpad_summary": "",
             "invalid_action_count": 0, "self_correction_success_count": 0,
             "ask_user_count": 0, "tool_error_count": 0, "tool_error_recovery_count": 0,
             "planner_context_tokens": 0, "answer_context_tokens": 0,
@@ -136,6 +149,11 @@ async def main() -> int:
             "messages": [],
             "sources": {},
             "evidence": {},
+            "candidate_docs": {},
+            "curated_evidence": {},
+            "verification_records": [],
+            "pruned_candidate_ids": [],
+            "prune_history": [],
             "visited_urls": [],
             "searched_queries": [],
         }
@@ -143,6 +161,18 @@ async def main() -> int:
         for name, fn in [
             ("clarify", nodes.clarify_node),
             ("rewrite", nodes.rewrite_node),
+            ("planner", nodes.planner_node),
+            ("parse_action", nodes.parse_action_node),
+            ("execute_action", nodes.execute_action_node),
+            ("planner", nodes.planner_node),
+            ("parse_action", nodes.parse_action_node),
+            ("execute_action", nodes.execute_action_node),
+            ("planner", nodes.planner_node),
+            ("parse_action", nodes.parse_action_node),
+            ("execute_action", nodes.execute_action_node),
+            ("planner", nodes.planner_node),
+            ("parse_action", nodes.parse_action_node),
+            ("execute_action", nodes.execute_action_node),
             ("planner", nodes.planner_node),
             ("parse_action", nodes.parse_action_node),
             ("execute_action", nodes.execute_action_node),
@@ -162,14 +192,21 @@ async def main() -> int:
         assert state["phase"] == "DONE", state["phase"]
         assert "M5" in state["final_answer"]
         assert state["clarifications"][0]["answer"] == "2026年"
-        # 2 个搜索结果；访问页与结果 A 同 URL，去重后复用编号 1
-        assert len(state["sources"]) == 2, state["sources"]
+        # 搜索结果先进入候选池；只有 curated evidence 被登记为最终来源
+        assert len(state["candidate_docs"]) == 2, state["candidate_docs"]
+        assert state["pruned_candidate_ids"] == [2], state["pruned_candidate_ids"]
+        assert len(state["curated_evidence"]) == 2, state["curated_evidence"]
+        assert len(state["verification_records"]) == 1, state["verification_records"]
+        assert state["verification_records"][0]["verdict"] == "supported"
+        assert len(state["sources"]) == 1, state["sources"]
         cited_ids = [c["id"] for c in state["cited_sources"]]
-        assert cited_ids == [1, 2], cited_ids
+        assert cited_ids == [1], cited_ids
         assert state["total_tokens"] > 0
-        assert len(state["evidence"]) == 2
+        assert len(state["evidence"]) == 1
         assert state["planner_context_tokens"] > 0
         assert state["answer_context_tokens"] > 0
+        planner_context, _ = build_planner_context(state)
+        assert "[C2]" not in planner_context
         print("PASS: 节点路径 =", " → ".join(nodes_visited))
         print("PASS: 来源数 =", len(state["sources"]), "| 引用 =", cited_ids)
         print("PASS: 最终回答 =", state["final_answer"])
@@ -210,6 +247,32 @@ async def main() -> int:
         assert disabled_update["invalid_action_count"] == 1
         assert "action disabled" in disabled_update["active_error"]
         print("PASS: benchmark 可禁用 ask_user 动作")
+
+        missing_candidate_state = {
+            **init,
+            "parsed_action": {
+                "action": "curate_evidence",
+                "args": {
+                    "candidate_id": 999,
+                    "claim": "不存在的候选",
+                    "quote_or_summary": "无",
+                    "confidence": 0.5,
+                },
+                "reason": "测试错误恢复",
+                "id": "call_missing_candidate",
+            },
+            "messages": [],
+            "sources": {},
+            "candidate_docs": {},
+            "curated_evidence": {},
+            "verification_records": [],
+            "pruned_candidate_ids": [],
+            "prune_history": [],
+        }
+        missing_update = await nodes.execute_action_node(missing_candidate_state)
+        assert missing_update["tool_error_count"] == 1
+        assert "candidate_id not found" in missing_update["active_error"]
+        print("PASS: curate_evidence 对不存在候选会进入可修复错误路径")
         print("\n全部断言通过 ✓")
     return 0
 

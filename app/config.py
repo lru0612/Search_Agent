@@ -13,11 +13,11 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     jina_api_key: str = ""
 
-    max_steps: int = 10
+    max_steps: int = 16
     max_reflect_rounds: int = 2
     max_clarify_rounds: int = 2
-    token_budget: int = 120_000
-    context_token_limit: int = 45_000
+    token_budget: int = 180_000
+    context_token_limit: int = 90_000
     llm_timeout_s: float = 120.0
     llm_max_retries: int = 2
 
